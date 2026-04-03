@@ -295,6 +295,9 @@ install_app() {
   fi
 
   # Extract tarball (strip top-level versioned dir: web4pr-vX.Y.Z/)
+  # --warning=no-unknown-keyword suppresses macOS xattr noise (com.apple.provenance)
+  tar xzf "$TMP_RELEASE/web4pr.tar.gz" --strip-components=1 -C "$INSTALL_DIR" \
+    --warning=no-unknown-keyword 2>/dev/null || \
   tar xzf "$TMP_RELEASE/web4pr.tar.gz" --strip-components=1 -C "$INSTALL_DIR"
 
   rm -rf "$TMP_RELEASE"
