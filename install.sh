@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Web4PR Installer
 # Usage: curl -fsSL https://raw.githubusercontent.com/DK5EN/web4pr/main/install.sh | sudo bash
+# Flags: --yes   non-interactive (auto-confirm upgrades, skip if already current)
 set -euo pipefail
 
 # ─── colors & logging ──────────────────────────────────────────────────────────
@@ -19,6 +20,18 @@ INSTALL_DIR="/opt/web4pr"
 SERVICE_USER="web4pr"
 SERVICE_FILE="/lib/systemd/system/web4pr.service"
 GITHUB_REPO="DK5EN/web4pr"
+VERSION_FILE="${INSTALL_DIR}/.version"
+
+# ─── parse flags ──────────────────────────────────────────────────────────────
+AUTO_YES=false
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y) AUTO_YES=true ;;
+    *)        POSITIONAL+=("$arg") ;;
+  esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
 
 # ─── check: must run as root ───────────────────────────────────────────────────
 check_root() {
@@ -43,6 +56,81 @@ check_os() {
   esac
 }
 
+# ─── preflight checks ─────────────────────────────────────────────────────────
+preflight_checks() {
+  banner "Pre-Flight Checks"
+  local failures=0
+
+  # 1) Python >= 3.11
+  local found_py=""
+  for pyver in python3.12 python3.11; do
+    if $pyver --version &>/dev/null 2>&1; then
+      found_py="$pyver"
+      break
+    fi
+  done
+  if [[ -n "$found_py" ]]; then
+    info "Python:  $($found_py --version) ✓"
+  else
+    local sysver
+    sysver=$(python3 --version 2>/dev/null | awk '{print $2}' || echo "not found")
+    warn "Python:  ${sysver} — Python >= 3.11 will be installed"
+  fi
+
+  # 2) RAM (minimum 256 MB total)
+  local total_mb
+  total_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
+  local avail_mb
+  avail_mb=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo)
+  if [[ "$total_mb" -lt 256 ]]; then
+    error "RAM:     ${total_mb} MB total — minimum 256 MB required"
+    ((failures++))
+  elif [[ "$total_mb" -lt 512 ]]; then
+    warn "RAM:     ${total_mb} MB total (${avail_mb} MB available) — tight but workable"
+  else
+    info "RAM:     ${total_mb} MB total (${avail_mb} MB available) ✓"
+  fi
+
+  # 3) uv
+  if command -v uv &>/dev/null; then
+    info "uv:      $(uv --version) ✓"
+  else
+    warn "uv:      not found — will be installed"
+  fi
+
+  # 4) Ports 8080 and 10093 free (ignore if held by web4pr itself)
+  local port_ok=true
+  for port in 8080 10093; do
+    local port_line
+    port_line=$(ss -tulpn 2>/dev/null | grep ":${port} " || true)
+    if [[ -n "$port_line" ]]; then
+      if echo "$port_line" | grep -q "web4pr\|uvicorn"; then
+        info "Port:    ${port} in use by Web4PR (will be restarted) ✓"
+      else
+        error "Port:    ${port} is already in use by another process"
+        ((failures++))
+        port_ok=false
+      fi
+    fi
+  done
+  if $port_ok; then
+    info "Ports:   8080 and 10093 available ✓"
+  fi
+
+  # 5) HAMNET connectivity (44.224.64.4 = db0fhn)
+  if ping -c1 -W3 44.224.64.4 &>/dev/null; then
+    info "HAMNET:  reachable ✓"
+  else
+    warn "HAMNET:  not reachable — VPN may need to be started after install"
+  fi
+
+  echo
+  if [[ "$failures" -gt 0 ]]; then
+    die "Pre-flight checks failed (${failures} critical). Fix the issues above before installing."
+  fi
+  info "Pre-flight checks passed"
+}
+
 # ─── install base deps (git required for aioax25 git dependency) ───────────────
 install_deps() {
   info "Installing base packages..."
@@ -51,26 +139,44 @@ install_deps() {
     git curl ca-certificates openssl
 }
 
-# ─── install Python 3.12 ──────────────────────────────────────────────────────
-install_python() {
-  if python3.12 --version &>/dev/null 2>&1; then
-    info "Python 3.12 already available: $(python3.12 --version)"
-    return
-  fi
+# ─── install Python >= 3.11 ───────────────────────────────────────────────────
+PYTHON_BIN=""
 
-  info "Installing Python 3.12..."
+install_python() {
+  # Prefer 3.12+, fall back to 3.11
+  for pyver in python3.12 python3.11; do
+    if $pyver --version &>/dev/null 2>&1; then
+      PYTHON_BIN="$pyver"
+      info "Python:  $($pyver --version) ✓"
+      return
+    fi
+  done
+
+  info "Installing Python..."
   if [[ "$OS_CODENAME" == "bookworm" ]]; then
+    # Try 3.12 from backports first, fall back to 3.11
     local list="/etc/apt/sources.list.d/bookworm-backports.list"
     if ! grep -q "bookworm-backports" "$list" 2>/dev/null; then
       echo "deb http://deb.debian.org/debian bookworm-backports main" > "$list"
       apt-get update -q
     fi
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -t bookworm-backports \
-      python3.12 python3.12-venv
+    if apt-cache show python3.12 &>/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -t bookworm-backports \
+        python3.12 python3.12-venv
+      PYTHON_BIN="python3.12"
+    else
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        python3.11 python3.11-venv
+      PYTHON_BIN="python3.11"
+    fi
   else
+    # Trixie+ should have 3.12+
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-      python3.12 python3.12-venv
+      python3 python3-venv
+    PYTHON_BIN="python3"
   fi
+
+  $PYTHON_BIN --version || die "Python installation failed"
 }
 
 # ─── install uv ───────────────────────────────────────────────────────────────
@@ -113,14 +219,24 @@ TMP_RELEASE=""
 VERSION=""
 
 download_release() {
-  local requested_version="${1:-}"
+  local arg="${1:-}"
 
-  if [[ -z "$requested_version" ]]; then
+  # Local tarball: install.sh /path/to/web4pr-v0.2.0.tar.gz
+  if [[ -n "$arg" && -f "$arg" ]]; then
+    info "Using local tarball: ${arg}"
+    VERSION=$(basename "$arg" | sed 's/web4pr-//;s/\.tar\.gz//')
+    TMP_RELEASE=$(mktemp -d)
+    cp "$arg" "$TMP_RELEASE/web4pr.tar.gz"
+    return
+  fi
+
+  # Version tag: install.sh v0.2.0
+  if [[ -n "$arg" ]]; then
+    VERSION="$arg"
+  else
     info "Fetching latest release version..."
     VERSION=$(get_latest_version)
     [[ -n "$VERSION" ]] || die "Could not determine latest release — check GitHub connectivity"
-  else
-    VERSION="$requested_version"
   fi
 
   info "Downloading Web4PR ${VERSION}..."
@@ -133,15 +249,35 @@ download_release() {
 
 # ─── detect existing installation ─────────────────────────────────────────────
 IS_UPGRADE=false
+INSTALLED_VERSION=""
 
 check_existing() {
   if [[ -f "$INSTALL_DIR/data/config.json" ]]; then
     IS_UPGRADE=true
-    warn "Existing Web4PR installation detected in ${INSTALL_DIR}"
-    ask "  Upgrade to ${VERSION}? [y/N] "
-    local answer
-    read -r answer </dev/tty
-    [[ "$answer" =~ ^[Yy]$ ]] || die "Aborted"
+
+    # Read installed version if available
+    if [[ -f "$VERSION_FILE" ]]; then
+      INSTALLED_VERSION=$(cat "$VERSION_FILE")
+    fi
+
+    # Already at target version — nothing to do
+    if [[ -n "$INSTALLED_VERSION" && "$INSTALLED_VERSION" == "$VERSION" ]]; then
+      info "Web4PR ${VERSION} is already installed and up to date"
+      exit 0
+    fi
+
+    if [[ -n "$INSTALLED_VERSION" ]]; then
+      warn "Existing installation: ${INSTALLED_VERSION} → upgrading to ${VERSION}"
+    else
+      warn "Existing installation detected (unknown version) → upgrading to ${VERSION}"
+    fi
+
+    if ! $AUTO_YES; then
+      ask "  Upgrade to ${VERSION}? [y/N] "
+      local answer
+      read -r answer </dev/tty
+      [[ "$answer" =~ ^[Yy]$ ]] || die "Aborted"
+    fi
   fi
 }
 
@@ -159,10 +295,18 @@ install_app() {
   fi
 
   # Extract tarball (strip top-level versioned dir: web4pr-vX.Y.Z/)
+  # On upgrade: exclude config.default.json to avoid overwriting user config template
+  local tar_opts=()
+  if $IS_UPGRADE; then
+    tar_opts+=(--exclude='*/config.default.json')
+  fi
   tar xzf "$TMP_RELEASE/web4pr.tar.gz" --strip-components=1 -C "$INSTALL_DIR" \
-    --exclude='*/config.default.json'   # don't overwrite config on upgrade
+    "${tar_opts[@]+"${tar_opts[@]}"}"
 
   rm -rf "$TMP_RELEASE"
+
+  # Write version marker (idempotency: enables skip-if-current on re-run)
+  echo "$VERSION" > "$VERSION_FILE"
 
   # Create service user
   if ! id "$SERVICE_USER" &>/dev/null; then
@@ -179,7 +323,7 @@ install_app() {
   # Install Python dependencies into .venv
   info "Installing Python dependencies..."
   cd "$INSTALL_DIR"
-  uv sync --frozen --no-dev --python python3.12
+  uv sync --frozen --no-dev --python "$PYTHON_BIN"
   info "Dependencies installed"
 }
 
@@ -191,6 +335,10 @@ interactive_setup() {
   if $IS_UPGRADE; then
     info "Upgrade — keeping existing configuration"
     return
+  fi
+
+  if $AUTO_YES; then
+    die "Fresh install requires interactive setup (callsign, password). Run without --yes."
   fi
 
   banner "Web4PR First-Run Setup"
@@ -269,7 +417,15 @@ config = {
         "callsign": os.environ["CALLSIGN"],
         "ssid": int(os.environ["SSID"])
     },
-    "endpoints": [],
+    "endpoints": [
+        {"id": "ep-001", "name": "DB0FHN Nuernberg", "remote_callsign": "DB0FHN", "host": "44.130.60.100", "port": 93, "description": "XNET, TH Nuernberg"},
+        {"id": "ep-002", "name": "DB0OVN Neuss", "remote_callsign": "DB0OVN", "host": "44.130.19.131", "port": 8093, "description": "XNET, Neuss"},
+        {"id": "ep-003", "name": "DB0IUZ Bochum", "remote_callsign": "DB0IUZ", "host": "44.149.52.209", "port": 8093, "description": "XNET, Sternwarte Bochum"},
+        {"id": "ep-004", "name": "DB0RES Rees", "remote_callsign": "DB0RES", "host": "44.149.28.10", "port": 93, "description": "XNET, Rees/Niederrhein"},
+        {"id": "ep-005", "name": "DB0PM Pegnitz", "remote_callsign": "DB0PM", "host": "44.149.12.4", "port": 93, "description": "XNET, Pegnitz/Oberfranken"},
+        {"id": "ep-006", "name": "DB0ED Erding", "remote_callsign": "DB0ED", "host": "44.149.19.3", "port": 10096, "description": "XNET, Notfunk-Digi Erding"},
+        {"id": "ep-007", "name": "DB0FRG Freiburg", "remote_callsign": "DB0FRG", "host": "44.149.180.131", "port": 93, "description": "DLC7/AXUDP, Freiburg"},
+    ],
     "incoming": {
         "enabled": False,
         "listen_port": 10093,
@@ -360,7 +516,7 @@ print_summary() {
 
   echo
   echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════╗${NC}"
-  echo -e "${GREEN}${BOLD}║   Web4PR installed successfully!         ║${NC}"
+  echo -e "${GREEN}${BOLD}║   Web4PR ${VERSION} installed!              ║${NC}"
   echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════╝${NC}"
   echo
   echo -e "  Open in your browser:  ${CYAN}http://${ip}:${PORT}${NC}"
@@ -381,11 +537,12 @@ main() {
 
   check_root
   check_os
+  preflight_checks
   install_deps
   install_python
   install_uv
-  download_release "${1:-}"   # optional: pass specific version, e.g. v0.2.0
-  check_existing
+  download_release "${1:-}"   # optional: pass specific version or local tarball
+  check_existing              # exits early if already at target version
   install_app
   interactive_setup
   write_config
