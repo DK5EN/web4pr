@@ -295,13 +295,7 @@ install_app() {
   fi
 
   # Extract tarball (strip top-level versioned dir: web4pr-vX.Y.Z/)
-  # On upgrade: exclude config.default.json to avoid overwriting user config template
-  local tar_opts=()
-  if $IS_UPGRADE; then
-    tar_opts+=(--exclude='*/config.default.json')
-  fi
-  tar xzf "$TMP_RELEASE/web4pr.tar.gz" --strip-components=1 -C "$INSTALL_DIR" \
-    "${tar_opts[@]+"${tar_opts[@]}"}"
+  tar xzf "$TMP_RELEASE/web4pr.tar.gz" --strip-components=1 -C "$INSTALL_DIR"
 
   rm -rf "$TMP_RELEASE"
 
@@ -327,13 +321,63 @@ install_app() {
   info "Dependencies installed"
 }
 
+# ─── merge endpoints on upgrade ──────────────────────────────────────────────
+merge_endpoints() {
+  local config_file="${INSTALL_DIR}/data/config.json"
+  local default_file="${INSTALL_DIR}/config.default.json"
+
+  [[ -f "$config_file" && -f "$default_file" ]] || return 0
+
+  info "Merging endpoint updates..."
+  "$INSTALL_DIR/.venv/bin/python" - "$config_file" "$default_file" <<'PYEOF'
+import json, sys
+
+config_file, default_file = sys.argv[1], sys.argv[2]
+
+with open(config_file) as f:
+    cfg = json.load(f)
+with open(default_file) as f:
+    defaults = json.load(f)
+
+existing = {ep["remote_callsign"] for ep in cfg.get("endpoints", [])}
+added = []
+
+for ep in defaults.get("endpoints", []):
+    if ep["remote_callsign"] not in existing:
+        cfg.setdefault("endpoints", []).append(ep)
+        added.append(ep["remote_callsign"])
+
+# Remove endpoints no longer in defaults (unless user-added with custom IDs)
+default_callsigns = {ep["remote_callsign"] for ep in defaults.get("endpoints", [])}
+default_ids = {ep["id"] for ep in defaults.get("endpoints", [])}
+before = len(cfg.get("endpoints", []))
+cfg["endpoints"] = [
+    ep for ep in cfg.get("endpoints", [])
+    if ep["remote_callsign"] in default_callsigns or ep["id"] not in default_ids
+]
+removed = before - len(cfg["endpoints"])
+
+if added or removed:
+    with open(config_file, "w") as f:
+        json.dump(cfg, f, indent=2)
+    if added:
+        print(f"  Added endpoints: {', '.join(added)}")
+    if removed:
+        print(f"  Removed {removed} obsolete endpoint(s)")
+else:
+    print("  Endpoints already up to date")
+PYEOF
+}
+
 # ─── interactive first-run setup ──────────────────────────────────────────────
 CALLSIGN="" SSID=0 USERNAME="" PORT=8080
 HASHED_PASSWORD="" JWT_SECRET=""
 
 interactive_setup() {
   if $IS_UPGRADE; then
-    info "Upgrade — keeping existing configuration"
+    merge_endpoints
+    chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/data/config.json"
+    info "Upgrade — existing configuration preserved"
     return
   fi
 
@@ -411,35 +455,32 @@ import json, os
 
 install_dir = os.environ["INSTALL_DIR"]
 
+# Read endpoints from config.default.json (single source of truth)
+default_file = os.path.join(install_dir, "config.default.json")
+with open(default_file) as f:
+    defaults = json.load(f)
+
 config = {
     "version": 1,
     "identity": {
         "callsign": os.environ["CALLSIGN"],
         "ssid": int(os.environ["SSID"])
     },
-    "endpoints": [
-        {"id": "ep-001", "name": "DB0FHN Nuernberg", "remote_callsign": "DB0FHN", "host": "44.130.60.100", "port": 93, "description": "XNET, TH Nuernberg"},
-        {"id": "ep-002", "name": "DB0OVN Neuss", "remote_callsign": "DB0OVN", "host": "44.130.19.131", "port": 8093, "description": "XNET, Neuss"},
-        {"id": "ep-003", "name": "DB0IUZ Bochum", "remote_callsign": "DB0IUZ", "host": "44.149.52.209", "port": 8093, "description": "XNET, Sternwarte Bochum"},
-        {"id": "ep-004", "name": "DB0RES Rees", "remote_callsign": "DB0RES", "host": "44.149.28.10", "port": 93, "description": "XNET, Rees/Niederrhein"},
-        {"id": "ep-005", "name": "DB0PM Pegnitz", "remote_callsign": "DB0PM", "host": "44.149.12.4", "port": 93, "description": "XNET, Pegnitz/Oberfranken"},
-        {"id": "ep-006", "name": "DB0ED Erding", "remote_callsign": "DB0ED", "host": "44.149.19.3", "port": 10096, "description": "XNET, Notfunk-Digi Erding"},
-        {"id": "ep-007", "name": "DB0FRG Freiburg", "remote_callsign": "DB0FRG", "host": "44.149.180.131", "port": 93, "description": "DLC7/AXUDP, Freiburg"},
-    ],
+    "endpoints": defaults["endpoints"],
     "incoming": {
         "enabled": False,
         "listen_port": 10093,
         "auto_answer": False,
         "auto_answer_callsigns": []
     },
-    "ax25": {
+    "ax25": defaults.get("ax25", {
         "t1_timeout_ms": 3000,
         "t2_response_delay_ms": 300,
         "t3_inactivity_timeout_ms": 180000,
         "n1_max_frame_length": 256,
         "n2_max_retries": 10,
         "modulo": 8
-    },
+    }),
     "application": {
         "websocket_port": int(os.environ["PORT"]),
         "log_level": "INFO",
