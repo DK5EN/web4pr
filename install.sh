@@ -117,8 +117,8 @@ preflight_checks() {
     info "Ports:   8080 and 10093 available ✓"
   fi
 
-  # 5) HAMNET connectivity (44.149.130.195 = DB0HOF)
-  if ping -c1 -W3 44.149.130.195 &>/dev/null; then
+  # 5) HAMNET connectivity (44.224.64.4 = db0fhn)
+  if ping -c1 -W3 44.224.64.4 &>/dev/null; then
     info "HAMNET:  reachable ✓"
   else
     warn "HAMNET:  not reachable — VPN may need to be started after install"
