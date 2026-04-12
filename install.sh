@@ -477,7 +477,7 @@ config = {
         "auto_answer_callsigns": []
     },
     "ax25": defaults.get("ax25", {
-        "t1_timeout_ms": 3000,
+        "t1_timeout_ms": 1500,
         "t2_response_delay_ms": 300,
         "t3_inactivity_timeout_ms": 180000,
         "n1_max_frame_length": 256,
