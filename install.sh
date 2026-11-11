@@ -22,6 +22,13 @@ SERVICE_FILE="/lib/systemd/system/web4pr.service"
 GITHUB_REPO="DK5EN/web4pr"
 VERSION_FILE="${INSTALL_DIR}/.version"
 
+# Legacy self-contained bundle for old 32-bit ARM (armv7) hosts w/o a modern Python: the
+# release ships a fat-tarball with its own python-build-standalone runtime + venv, so the
+# installer neither installs Python/uv nor runs `uv sync`. glibc tag matches the PBS
+# runtime's floor (see docs/legacy-arm-deployment.md and packaging/legacy-jessie/).
+IS_LEGACY=false
+LEGACY_GLIBC_TAG="glibc2.17"
+
 # ─── parse flags ──────────────────────────────────────────────────────────────
 AUTO_YES=false
 POSITIONAL=()
@@ -56,25 +63,46 @@ check_os() {
   esac
 }
 
+# ─── detect legacy target (old 32-bit ARM without a modern Python) ─────────────
+detect_legacy() {
+  local arch; arch="$(uname -m)"
+  case "$arch" in
+    armv7l|armv6l) ;;
+    *) return ;;               # 64-bit / x86 → normal path
+  esac
+  # A modern interpreter present → normal path works. Otherwise the system Python is too
+  # old (e.g. Jessie's 3.4) and there is no armv7 python-build-standalone via `uv`, so we
+  # install the prebuilt self-contained bundle instead.
+  if command -v python3.12 &>/dev/null || command -v python3.11 &>/dev/null; then
+    return
+  fi
+  IS_LEGACY=true
+  warn "Legacy target (${arch}, no Python >= 3.11) — installing self-contained bundle"
+}
+
 # ─── preflight checks ─────────────────────────────────────────────────────────
 preflight_checks() {
   banner "Pre-Flight Checks"
   local failures=0
 
-  # 1) Python >= 3.11
-  local found_py=""
-  for pyver in python3.12 python3.11; do
-    if $pyver --version &>/dev/null 2>&1; then
-      found_py="$pyver"
-      break
-    fi
-  done
-  if [[ -n "$found_py" ]]; then
-    info "Python:  $($found_py --version) ✓"
+  # 1) Python >= 3.11 (legacy bundle ships its own runtime — nothing to check)
+  if $IS_LEGACY; then
+    info "Python:  bundled runtime (self-contained legacy bundle) ✓"
   else
-    local sysver
-    sysver=$(python3 --version 2>/dev/null | awk '{print $2}' || echo "not found")
-    warn "Python:  ${sysver} — Python >= 3.11 will be installed"
+    local found_py=""
+    for pyver in python3.12 python3.11; do
+      if $pyver --version &>/dev/null 2>&1; then
+        found_py="$pyver"
+        break
+      fi
+    done
+    if [[ -n "$found_py" ]]; then
+      info "Python:  $($found_py --version) ✓"
+    else
+      local sysver
+      sysver=$(python3 --version 2>/dev/null | awk '{print $2}' || echo "not found")
+      warn "Python:  ${sysver} — Python >= 3.11 will be installed"
+    fi
   fi
 
   # 2) RAM (minimum 256 MB total)
@@ -91,8 +119,10 @@ preflight_checks() {
     info "RAM:     ${total_mb} MB total (${avail_mb} MB available) ✓"
   fi
 
-  # 3) uv
-  if command -v uv &>/dev/null; then
+  # 3) uv (not used for legacy — the bundle already contains the venv)
+  if $IS_LEGACY; then
+    info "uv:      not needed (prebuilt bundle) ✓"
+  elif command -v uv &>/dev/null; then
     info "uv:      $(uv --version) ✓"
   else
     warn "uv:      not found — will be installed"
@@ -114,14 +144,14 @@ preflight_checks() {
     fi
   done
   if $port_ok; then
-    info "Ports:   8080 and 10093 available ✓"
+    info "Ports:   8080 and 10093 free locally ✓ (incoming 10093/udp from HAMnet needs a port forward on the HAMnet gateway)"
   fi
 
   # 5) HAMNET connectivity (44.149.130.195 = DB0HOF)
   if ping -c1 -W3 44.149.130.195 &>/dev/null; then
-    info "HAMNET:  reachable ✓"
+    info "HAMNET:  reachable directly ✓"
   else
-    warn "HAMNET:  not reachable — VPN may need to be started after install"
+    warn "HAMNET:  not directly reachable — fine if a SOCKS5 proxy is configured (Settings > Proxy)"
   fi
 
   echo
@@ -133,6 +163,17 @@ preflight_checks() {
 
 # ─── install base deps (git required for aioax25 git dependency) ───────────────
 install_deps() {
+  if $IS_LEGACY; then
+    # Don't touch apt on the legacy OS: its repos are archived/expired and the "don't
+    # pollute the system" rule applies. The bundle is fully self-contained; we only need
+    # curl (download), openssl (JWT secret) and tar — present on any base system.
+    local tool
+    for tool in curl openssl tar; do
+      command -v "$tool" &>/dev/null || die "Legacy install requires '${tool}', but it is missing"
+    done
+    info "Legacy: skipping apt (self-contained bundle)"
+    return
+  fi
   info "Installing base packages..."
   apt-get update -q
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -143,6 +184,13 @@ install_deps() {
 PYTHON_BIN=""
 
 install_python() {
+  if $IS_LEGACY; then
+    # Runtime comes from the bundle; point PYTHON_BIN at the bundled venv (created when
+    # the tarball is extracted in install_app — used only for hashing/config afterwards).
+    PYTHON_BIN="${INSTALL_DIR}/.venv/bin/python"
+    info "Python:  using bundled runtime (legacy)"
+    return
+  fi
   # Prefer 3.12+, fall back to 3.11
   for pyver in python3.12 python3.11; do
     if $pyver --version &>/dev/null 2>&1; then
@@ -181,6 +229,9 @@ install_python() {
 
 # ─── install uv ───────────────────────────────────────────────────────────────
 install_uv() {
+  if $IS_LEGACY; then
+    return   # bundle ships its own venv; uv is never used on the legacy target
+  fi
   if command -v uv &>/dev/null; then
     info "uv already available: $(uv --version)"
     return
@@ -240,7 +291,13 @@ download_release() {
   fi
 
   info "Downloading Web4PR ${VERSION}..."
-  local url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/web4pr-${VERSION}.tar.gz"
+  local asset
+  if $IS_LEGACY; then
+    asset="web4pr-${VERSION}-linux-armv7-${LEGACY_GLIBC_TAG}.tar.gz"
+  else
+    asset="web4pr-${VERSION}.tar.gz"
+  fi
+  local url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${asset}"
 
   TMP_RELEASE=$(mktemp -d)
   curl -fsSL --progress-bar "$url" -o "$TMP_RELEASE/web4pr.tar.gz" \
@@ -294,11 +351,19 @@ install_app() {
     systemctl stop web4pr
   fi
 
-  # Extract tarball (strip top-level versioned dir: web4pr-vX.Y.Z/)
-  # --warning=no-unknown-keyword suppresses macOS xattr noise (com.apple.provenance)
-  tar xzf "$TMP_RELEASE/web4pr.tar.gz" --strip-components=1 -C "$INSTALL_DIR" \
-    --warning=no-unknown-keyword 2>/dev/null || \
-  tar xzf "$TMP_RELEASE/web4pr.tar.gz" --strip-components=1 -C "$INSTALL_DIR"
+  # Extract tarball. The legacy fat-tarball has its contents at the archive root
+  # (built via `docker cp /opt/web4pr/.`), so it extracts straight into INSTALL_DIR with
+  # no --strip-components. The normal tarball nests everything under web4pr-vX.Y.Z/.
+  # --warning=no-unknown-keyword suppresses macOS xattr noise (com.apple.provenance).
+  if $IS_LEGACY; then
+    tar xzf "$TMP_RELEASE/web4pr.tar.gz" -C "$INSTALL_DIR" \
+      --warning=no-unknown-keyword 2>/dev/null || \
+    tar xzf "$TMP_RELEASE/web4pr.tar.gz" -C "$INSTALL_DIR"
+  else
+    tar xzf "$TMP_RELEASE/web4pr.tar.gz" --strip-components=1 -C "$INSTALL_DIR" \
+      --warning=no-unknown-keyword 2>/dev/null || \
+    tar xzf "$TMP_RELEASE/web4pr.tar.gz" --strip-components=1 -C "$INSTALL_DIR"
+  fi
 
   rm -rf "$TMP_RELEASE"
 
@@ -317,11 +382,15 @@ install_app() {
   chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/data"
   chmod 750 "$INSTALL_DIR/data"
 
-  # Install Python dependencies into .venv
-  info "Installing Python dependencies..."
-  cd "$INSTALL_DIR"
-  uv sync --frozen --no-dev --python "$PYTHON_BIN"
-  info "Dependencies installed"
+  # Install Python dependencies into .venv (legacy bundle already contains runtime + venv)
+  if $IS_LEGACY; then
+    info "Legacy: bundle ships its own runtime + venv — no dependency install needed"
+  else
+    info "Installing Python dependencies..."
+    cd "$INSTALL_DIR"
+    uv sync --frozen --no-dev --python "$PYTHON_BIN"
+    info "Dependencies installed"
+  fi
 }
 
 # ─── merge endpoints on upgrade ──────────────────────────────────────────────
@@ -424,11 +493,13 @@ interactive_setup() {
     warn "Passwords do not match, try again"
   done
 
-  # Hash password using bcrypt (available after uv sync)
+  # Hash password using the app's own scrypt helper (single source of truth for the
+  # hash format; web4pr.pwhash is side-effect-free, so importing it here does not
+  # touch config on disk). Available after uv sync.
   info "Hashing password..."
   HASHED_PASSWORD=$(
     PASS="$pass1" "$INSTALL_DIR/.venv/bin/python" -c \
-      "import bcrypt, os; print(bcrypt.hashpw(os.environ['PASS'].encode(), bcrypt.gensalt()).decode())"
+      "import os; from web4pr.pwhash import hash_password; print(hash_password(os.environ['PASS']))"
   )
 
   # Generate JWT secret
@@ -484,6 +555,8 @@ config = {
         "n2_max_retries": 10,
         "modulo": 8
     }),
+    # SOCKS5 proxy for outbound AXUDP (off by default; set via Settings > Proxy)
+    "proxy": defaults.get("proxy", {"enabled": False, "host": "", "port": 1080}),
     "application": {
         "websocket_port": int(os.environ["PORT"]),
         "log_level": "INFO",
@@ -521,6 +594,14 @@ setup_systemd() {
     )
   fi
 
+  # Legacy bundle: the python-build-standalone runtime has no system-trusted CA roots on
+  # the old OS (no ISRG Root X1 → Let's Encrypt fails). Point outbound TLS at certifi's
+  # bundle so HAMnetDB/GitHub HTTPS work. (See docs/legacy-arm-deployment.md §7.)
+  local ssl_env=""
+  if $IS_LEGACY; then
+    ssl_env="Environment=SSL_CERT_FILE=${INSTALL_DIR}/.venv/lib/python3.11/site-packages/certifi/cacert.pem"
+  fi
+
   cat > "$SERVICE_FILE" <<UNIT
 [Unit]
 Description=Web4PR — Web-based Packet Radio Client
@@ -533,6 +614,7 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${INSTALL_DIR}
+${ssl_env}
 ExecStart=${INSTALL_DIR}/.venv/bin/uvicorn web4pr.main:app --host 0.0.0.0 --port ${PORT}
 Restart=on-failure
 RestartSec=10
@@ -581,6 +663,7 @@ main() {
 
   check_root
   check_os
+  detect_legacy              # sets IS_LEGACY for old 32-bit ARM without Python >= 3.11
   preflight_checks
   install_deps
   install_python
